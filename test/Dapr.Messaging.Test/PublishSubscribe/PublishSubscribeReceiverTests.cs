@@ -1104,6 +1104,121 @@ public class PublishSubscribeReceiverTests
     }
 
     /// <summary>
+    /// With N handlers, exactly N messages are in flight while they are busy and the rest wait. N = 1 is the
+    /// default and the throughput ceiling this option lifts: one parked handler holds every other message back.
+    /// </summary>
+    [Theory]
+    [InlineData(1)]
+    [InlineData(4)]
+    public async Task ProcessTopicChannelMessagesAsync_ShouldHandleAtMostMaximumConcurrentHandlersMessagesAtOnce(int concurrency)
+    {
+        const string pubSubName = "testPubSub";
+        const string topicName = "testTopic";
+        var options =
+            new DaprSubscriptionOptions(new MessageHandlingPolicy(TimeSpan.FromSeconds(5), TopicResponseAction.Success))
+            {
+                MaximumConcurrentHandlers = concurrency, MaximumCleanupTimeout = TimeSpan.FromSeconds(1)
+            };
+
+        // Every handler parks on the gate, so only concurrent dispatch lets several start — and no more
+        // than MaximumConcurrentHandlers of them.
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var allStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var started = 0;
+        var messageHandler = new TopicMessageHandler(async (_, _) =>
+        {
+            if (Interlocked.Increment(ref started) == concurrency)
+            {
+                allStarted.SetResult();
+            }
+            await gate.Task;
+            return TopicResponseAction.Success;
+        });
+
+        // Acks written to the sidecar stream, collected as they land (the initial request has no EventProcessed).
+        const int messageCount = 8;
+        var acknowledged = new System.Collections.Concurrent.ConcurrentBag<string>();
+        var allAcknowledged = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var mockRequestStream = new Mock<IClientStreamWriter<P.SubscribeTopicEventsRequestAlpha1>>();
+        mockRequestStream.Setup(s => s.WriteAsync(It.IsAny<P.SubscribeTopicEventsRequestAlpha1>(), It.IsAny<CancellationToken>()))
+            .Returns((P.SubscribeTopicEventsRequestAlpha1 request, CancellationToken _) =>
+            {
+                if (request.EventProcessed is { } processed)
+                {
+                    acknowledged.Add(processed.Id);
+                    if (acknowledged.Count == messageCount)
+                    {
+                        allAcknowledged.TrySetResult();
+                    }
+                }
+                return Task.CompletedTask;
+            });
+        var mockDaprClient = new Mock<P.Dapr.DaprClient>();
+        mockDaprClient.Setup(client => client.SubscribeTopicEventsAlpha1(null, null, It.IsAny<CancellationToken>()))
+            .Returns(CreateMockCall(mockRequestStream));
+
+        await using var receiver = new PublishSubscribeReceiver(pubSubName, topicName, options, messageHandler, mockDaprClient.Object);
+        await receiver.SubscribeAsync(TestContext.Current.CancellationToken);
+
+        for (var i = 0; i < messageCount; i++)
+        {
+            await receiver.WriteMessageToChannelAsync(
+                new TopicMessage($"id-{i}", "source", "type", "specVersion", "dataContentType", topicName, pubSubName));
+        }
+
+        await allStarted.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+        await Task.Delay(100, TestContext.Current.CancellationToken);
+        Assert.Equal(concurrency, Volatile.Read(ref started)); // the bound holds while the first batch is parked
+        gate.SetResult();
+
+        // Every message is acknowledged exactly once, from several workers.
+        await allAcknowledged.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+        Assert.Equal(messageCount, acknowledged.Distinct().Count());
+    }
+
+    [Fact]
+    public async Task Completion_WhenOneOfSeveralConcurrentHandlersThrows_FaultsWithDaprException()
+    {
+        const string pubSubName = "testPubSub";
+        const string topicName = "testTopic";
+        var options =
+            new DaprSubscriptionOptions(new MessageHandlingPolicy(TimeSpan.FromSeconds(5), TopicResponseAction.Success))
+            {
+                MaximumConcurrentHandlers = 4, MaximumCleanupTimeout = TimeSpan.FromSeconds(1)
+            };
+
+        // Three handlers park until cancelled; the fourth throws. The fault must surface on Completion
+        // while its siblings are still in flight, which requires the loop to cancel them.
+        var never = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var messageHandler = new TopicMessageHandler(async (message, token) =>
+        {
+            if (message.Id == "boom")
+            {
+                throw new InvalidOperationException("handler failed");
+            }
+            await never.Task.WaitAsync(token);
+            return TopicResponseAction.Success;
+        });
+
+        var mockDaprClient = new Mock<P.Dapr.DaprClient>();
+        mockDaprClient.Setup(client => client.SubscribeTopicEventsAlpha1(null, null, It.IsAny<CancellationToken>()))
+            .Returns(CreateMockCall());
+
+        await using var receiver = new PublishSubscribeReceiver(pubSubName, topicName, options, messageHandler, mockDaprClient.Object);
+        await receiver.SubscribeAsync(TestContext.Current.CancellationToken);
+
+        foreach (var id in new[] { "a", "b", "c", "boom" })
+        {
+            await receiver.WriteMessageToChannelAsync(
+                new TopicMessage(id, "source", "type", "specVersion", "dataContentType", topicName, pubSubName));
+        }
+
+        var ex = await Assert.ThrowsAsync<DaprException>(() =>
+            receiver.Completion.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
+        Assert.IsType<InvalidOperationException>(ex.InnerException);
+    }
+
+    /// <summary>
     /// Helper: creates a mock AsyncDuplexStreamingCall. Defaults (WriteAsync→Completed, MoveNext→false)
     /// are only applied to mocks the helper creates itself; caller-provided mocks are left untouched.
     /// </summary>

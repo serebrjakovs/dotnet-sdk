@@ -47,6 +47,22 @@ public sealed record DaprSubscriptionOptions(MessageHandlingPolicy MessageHandli
     public int? MaximumQueuedMessages { get; init; }
 
     /// <summary>
+    /// The maximum number of messages handled concurrently. Defaults to 1: one message at a time, in order.
+    /// Above 1, up to that many handlers run at once and ordering between them is not preserved.
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">Thrown when set to a value less than 1.</exception>
+    public int MaximumConcurrentHandlers
+    {
+        get => _maximumConcurrentHandlers;
+        init
+        {
+            ArgumentOutOfRangeException.ThrowIfLessThan(value, 1);
+            _maximumConcurrentHandlers = value;
+        }
+    }
+    private readonly int _maximumConcurrentHandlers = 1;
+
+    /// <summary>
     /// The maximum amount of time to take to dispose of acknowledgement messages after the cancellation token has
     /// been signaled.
     /// </summary>

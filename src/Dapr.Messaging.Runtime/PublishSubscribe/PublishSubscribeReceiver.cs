@@ -55,10 +55,11 @@ internal sealed class PublishSubscribeReceiver : IDaprSubscription
     /// </summary>
     private readonly Channel<TopicMessage> _topicMessagesChannel;
     /// <summary>
-    /// A channel maintaining acknowledgements for each message awaiting submission to the sidecar.
+    /// A channel maintaining acknowledgements for each message awaiting submission to the sidecar. Concurrent
+    /// handlers each write their own acknowledgement, so it has many writers and one reader.
     /// </summary>
     private readonly Channel<TopicAcknowledgement> _acknowledgementsChannel =
-        Channel.CreateUnbounded<TopicAcknowledgement>(UnboundedChannelOptions);
+        Channel.CreateUnbounded<TopicAcknowledgement>(new UnboundedChannelOptions { SingleReader = true });
     /// <summary>
     /// The handler delegate responsible for processing the topic messages.
     /// </summary>
@@ -362,7 +363,8 @@ internal sealed class PublishSubscribeReceiver : IDaprSubscription
 
     /// <summary>
     /// Processes each topic message from the messages channel as it's populated, invoking the message
-    /// handler and writing the resulting acknowledgement back to the sidecar.
+    /// handler and writing the resulting acknowledgement back to the sidecar, up to
+    /// <see cref="DaprSubscriptionOptions.MaximumConcurrentHandlers"/> messages at a time.
     /// </summary>
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <returns>A task that completes when the topic messages channel reader has finished (i.e. the
@@ -375,24 +377,30 @@ internal sealed class PublishSubscribeReceiver : IDaprSubscription
     /// </remarks>
     private async Task ProcessTopicChannelMessagesAsync(CancellationToken cancellationToken)
     {
-        await foreach (var message in _topicMessagesChannel.Reader.ReadAllAsync(cancellationToken))
+        var parallelOptions = new ParallelOptions
         {
-            using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            cts.CancelAfter(_options.MessageHandlingPolicy.TimeoutDuration);
+            MaxDegreeOfParallelism = _options.MaximumConcurrentHandlers, CancellationToken = cancellationToken
+        };
 
-            TopicResponseAction messageAction;
-            try
+        await Parallel.ForEachAsync(_topicMessagesChannel.Reader.ReadAllAsync(cancellationToken), parallelOptions,
+            async (message, ct) =>
             {
-                messageAction = await _messageHandler(message, cts.Token);
-            }
-            catch (OperationCanceledException) when (cts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
-            {
-                // the handler outlasted its timeout, not a shutdown: answer the policy's default
-                messageAction = _options.MessageHandlingPolicy.DefaultResponseAction;
-            }
+                using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                cts.CancelAfter(_options.MessageHandlingPolicy.TimeoutDuration);
 
-            await AcknowledgeMessageAsync(message.Id, messageAction, cancellationToken);
-        }
+                TopicResponseAction messageAction;
+                try
+                {
+                    messageAction = await _messageHandler(message, cts.Token);
+                }
+                catch (OperationCanceledException) when (cts.IsCancellationRequested && !ct.IsCancellationRequested)
+                {
+                    // the handler outlasted its timeout, not a shutdown: answer the policy's default
+                    messageAction = _options.MessageHandlingPolicy.DefaultResponseAction;
+                }
+
+                await AcknowledgeMessageAsync(message.Id, messageAction, ct);
+            });
     }
 
     /// <summary>

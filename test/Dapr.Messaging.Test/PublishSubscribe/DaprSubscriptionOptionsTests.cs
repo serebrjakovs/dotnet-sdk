@@ -58,6 +58,29 @@ public sealed class DaprSubscriptionOptionsTests
     }
 
     [Fact]
+    public void DefaultMaximumConcurrentHandlers_IsOne()
+    {
+        var options = new DaprSubscriptionOptions(DefaultPolicy);
+        Assert.Equal(1, options.MaximumConcurrentHandlers);
+    }
+
+    [Fact]
+    public void MaximumConcurrentHandlers_CanBeSet()
+    {
+        var options = new DaprSubscriptionOptions(DefaultPolicy) { MaximumConcurrentHandlers = 8 };
+        Assert.Equal(8, options.MaximumConcurrentHandlers);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)] // -1 would mean "unbounded" to Parallel.ForEachAsync
+    public void MaximumConcurrentHandlers_BelowOne_Throws(int value)
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new DaprSubscriptionOptions(DefaultPolicy) { MaximumConcurrentHandlers = value });
+    }
+
+    [Fact]
     public void DeadLetterTopic_CanBeSet()
     {
         var options = new DaprSubscriptionOptions(DefaultPolicy) { DeadLetterTopic = "my-dead-letter" };

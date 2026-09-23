@@ -39,6 +39,16 @@ await using var subscription = await messagingClient.SubscribeAsync(
 await ((IDaprSubscription)subscription).Completion.WaitAsync(cancellationToken);
 ```
 
+## Handler Concurrency
+
+By default messages are handed to your handler one at a time, in order, so throughput is one message per handler latency. `MaximumConcurrentHandlers` lets up to that many handlers run at once; each message is still acknowledged once, as its handler finishes, but ordering between them is no longer preserved.
+
+```csharp
+var options = new DaprSubscriptionOptions(policy) { MaximumConcurrentHandlers = 8 };
+```
+
+Each handler still gets its own `TimeoutDuration`, and a handler that throws still ends the subscription (in-flight siblings are cancelled and left for redelivery). The sidecar pulls from the broker independently of this setting; where the component offers its own limit (for example `concurrencyLimit` on AWS SNS/SQS), set it to the same value so messages the app cannot take yet stay in the broker rather than waiting in the sidecar.
+
 ## Reconnection & Lifetime Management
 
 `SubscribeAsync` returns an `IAsyncDisposable` that also implements `IDaprSubscription`. The `Completion` property exposes a `Task` representing the background stream lifecycle. When the connection closes or encounters a fatal error, `Completion` finishes, allowing your supervision loop to re-subscribe with backoff delay.
