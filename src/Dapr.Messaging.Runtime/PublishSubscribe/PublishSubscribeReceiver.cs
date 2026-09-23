@@ -380,17 +380,18 @@ internal sealed class PublishSubscribeReceiver : IDaprSubscription
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             cts.CancelAfter(_options.MessageHandlingPolicy.TimeoutDuration);
 
-            var messageAction = await _messageHandler(message, cts.Token);
-
+            TopicResponseAction messageAction;
             try
             {
-                await AcknowledgeMessageAsync(message.Id, messageAction, cancellationToken);
+                messageAction = await _messageHandler(message, cts.Token);
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) when (cts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
             {
-                await AcknowledgeMessageAsync(message.Id, _options.MessageHandlingPolicy.DefaultResponseAction,
-                    cancellationToken);
+                // the handler outlasted its timeout, not a shutdown: answer the policy's default
+                messageAction = _options.MessageHandlingPolicy.DefaultResponseAction;
             }
+
+            await AcknowledgeMessageAsync(message.Id, messageAction, cancellationToken);
         }
     }
 

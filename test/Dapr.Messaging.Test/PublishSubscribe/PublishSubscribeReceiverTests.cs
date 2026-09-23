@@ -400,6 +400,72 @@ public class PublishSubscribeReceiverTests
         await receiver.DisposeAsync();
     }
 
+    /// <summary>
+    /// A handler that honours its token and outlasts <see cref="MessageHandlingPolicy.TimeoutDuration"/> is
+    /// acknowledged with <see cref="MessageHandlingPolicy.DefaultResponseAction"/>, and the subscription keeps
+    /// handling the messages behind it.
+    /// </summary>
+    [Fact]
+    public async Task ProcessTopicChannelMessages_HandlerTimeout_AcknowledgesDefaultActionAndContinues()
+    {
+        const string pubSubName = "testPubSub";
+        const string topicName = "testTopic";
+        var options = new DaprSubscriptionOptions(
+            new MessageHandlingPolicy(TimeSpan.FromMilliseconds(100), TopicResponseAction.Retry))
+        { MaximumCleanupTimeout = TimeSpan.FromSeconds(1) };
+
+        var acks = new System.Collections.Concurrent.ConcurrentQueue<P.SubscribeTopicEventsRequestProcessedAlpha1>();
+        var bothAcknowledged = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var mockRequestStream = new Mock<IClientStreamWriter<P.SubscribeTopicEventsRequestAlpha1>>();
+        mockRequestStream
+            .Setup(s => s.WriteAsync(It.IsAny<P.SubscribeTopicEventsRequestAlpha1>(), It.IsAny<CancellationToken>()))
+            .Returns((P.SubscribeTopicEventsRequestAlpha1 request, CancellationToken _) =>
+            {
+                if (request.EventProcessed is { } processed)
+                {
+                    acks.Enqueue(processed);
+                    if (acks.Count == 2)
+                    {
+                        bothAcknowledged.TrySetResult();
+                    }
+                }
+                return Task.CompletedTask;
+            });
+
+        var mockDaprClient = new Mock<P.Dapr.DaprClient>();
+        mockDaprClient.Setup(c => c.SubscribeTopicEventsAlpha1(null, null, It.IsAny<CancellationToken>()))
+            .Returns(CreateMockCall(mockRequestStream));
+
+        await using var receiver = new PublishSubscribeReceiver(pubSubName, topicName, options,
+            async (message, token) =>
+            {
+                if (message.Id == "slow")
+                {
+                    await Task.Delay(Timeout.Infinite, token);
+                }
+                return TopicResponseAction.Success;
+            }, mockDaprClient.Object);
+
+        await receiver.SubscribeAsync(TestContext.Current.CancellationToken);
+        await receiver.WriteMessageToChannelAsync(new TopicMessage("slow", "src", "type", "1.0", "text/plain", topicName, pubSubName));
+        await receiver.WriteMessageToChannelAsync(new TopicMessage("next", "src", "type", "1.0", "text/plain", topicName, pubSubName));
+
+        await bothAcknowledged.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        Assert.Collection(acks,
+            slow =>
+            {
+                Assert.Equal("slow", slow.Id);
+                Assert.Equal(TopicEventResponse.Types.TopicEventResponseStatus.Retry, slow.Status.Status);
+            },
+            next =>
+            {
+                Assert.Equal("next", next.Id);
+                Assert.Equal(TopicEventResponse.Types.TopicEventResponseStatus.Success, next.Status.Status);
+            });
+        Assert.False(receiver.Completion.IsCompleted);
+    }
+
     [Fact]
     public async Task ProcessTopicChannelMessages_DropAction_WritesDropAcknowledgement()
     {
